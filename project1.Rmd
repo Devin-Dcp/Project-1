@@ -1,0 +1,1457 @@
+---
+title: "Project1"
+author: "Chengpeng Dai"
+date: "2025-06-13"
+output:
+  pdf_document:
+    latex_engine: xelatex
+  word_document: default
+---
+
+```{r setup, include=FALSE}
+knitr::opts_chunk$set(echo = TRUE)
+```
+
+## R Markdown
+
+This is an R Markdown document. Markdown is a simple formatting syntax for authoring HTML, PDF, and MS Word documents. For more details on using R Markdown see <http://rmarkdown.rstudio.com>.
+
+When you click the **Knit** button a document will be generated that includes both content as well as the output of any embedded R code chunks within the document. You can embed an R code chunk like this:
+
+# Load common packages
+```{r}
+library(tidyverse)
+library(lubridate)
+library(naniar)
+library(GGally)
+library(corrplot)
+library(sf)
+library(tmap)
+library(spdep)
+library(lme4)
+library(feasts)
+library(zoo)
+library(INLA)
+library(car)
+library(glmnet)
+library(caret)
+library(e1071)
+library(dplyr)
+library(tibble)
+library(rsample)
+library(rjags)
+library(patchwork)
+library(rnaturalearth)
+library(rnaturalearthdata)
+library(ggplot2)
+library(scales)
+library(knitr)
+```
+
+# EDA
+```{r}
+df <- read_csv("/Users/Devin/Library/CloudStorage/OneDrive-UniversityofEdinburgh/24Fall-3/Project_1/Uoe_data_all.csv")
+  
+df$GymUsableSqFt <- NULL
+df$GymMaxOccupancy <- NULL
+
+df <- df %>%
+  mutate(
+    StartMonth = as.Date(as.yearmon(StartMonth, "%b-%y"))
+  )
+```
+
+```{r}
+# Univariate exploration
+# Distribution of numerical variables: Histogram + Density plot
+key_numeric_vars <- c("TotalMembers",
+                      "AvgAccountPayment",
+                      "PromoPercentage", 
+                      "AvgJoiningFee", 
+                      "user_density",
+                      "CompetitorIndex")
+
+df %>%
+  select(all_of(key_numeric_vars)) %>%
+  mutate(across(everything(), as.numeric)) %>%
+  pivot_longer(
+    cols = everything(),
+    names_to = "var",
+    values_to = "value"
+  ) %>%
+  group_by(var) %>%
+  mutate(skewness = e1071::skewness(value, na.rm = TRUE)) %>%
+  ggplot(aes(x = value)) +
+  geom_histogram(bins = 30, fill = NA, color = "black") +
+  geom_density(color = "blue") +
+    facet_wrap(~ paste0(var, '\nSkew=', round(skewness,2)), scales = "free", ncol = 3) +
+  labs(title = "Distribution and Skewness of Key Numerical Variables")
+```
+
+
+```{r}
+# Distribution of categorical variables
+df$GymSiteType <- factor(df$GymSiteType, levels = c("Hybrid", "Residential", "Workforce"))
+df$GymParking <- factor(df$GymParking, levels = c("No Parking", "Parking"))
+# 1. GymSiteType
+p1 <- df %>%
+  count(GymSiteType) %>%
+  ggplot(aes(x = n, y = GymSiteType, fill = GymSiteType)) +
+  geom_col(show.legend = FALSE) +
+  scale_fill_brewer(palette = "Set2") +
+  coord_flip() +
+  labs(title = "Gym Site Type Distribution", x = "Count", y = "GymSiteType")
+
+# 2. GymParking
+p2 <- df %>%
+  count(GymParking) %>%
+  ggplot(aes(x = GymParking, y = n, fill = GymParking)) +
+  geom_col(show.legend = FALSE) +
+  scale_fill_brewer(palette = "Set1") +
+  labs(title = "Parking Availability", x = "Parking", y = "Count")
+
+# 3. GymSiteType and TotalMembers
+p3 <- ggplot(df, aes(x = GymSiteType, y = TotalMembers, fill = GymSiteType)) +
+  geom_boxplot(outlier.shape = NA) +
+  scale_fill_brewer(palette = "Set2") +
+  labs(title = "Total Members by Gym Site Type", x = "GymSiteType", y = "TotalMembers") +
+  theme(legend.position = "none")
+
+# 4. GymParking 与 TotalMembers
+p4 <- ggplot(df, aes(x = GymParking, y = TotalMembers, fill = GymParking)) +
+  geom_boxplot(outlier.shape = NA) +
+  scale_fill_brewer(palette = "Set1") +
+  labs(title = "Total Members by Parking Availability", x = "Parking", y = "TotalMembers") +
+  theme(legend.position = "none")
+
+(p1 | p2) / (p3 | p4)
+```
+```{r}
+# Time series
+df %>%
+  group_by(StartMonth) %>%
+  summarize(total_members = sum(TotalMembers, na.rm = TRUE)) %>%
+  ggplot(aes(x = StartMonth, y = total_members)) +
+    geom_line() +
+    geom_smooth(method = "loess") +
+    labs(title = "Trend of monthly membership numbers in the full sample",
+         y = "Total number of members")
+
+# Examples of categorical trend
+df %>%
+  group_by(StartMonth, GymSiteType) %>%
+  summarize(total = sum(TotalMembers, na.rm = TRUE)) %>%
+  ggplot(aes(x = StartMonth, y = total, color = GymSiteType)) +
+    geom_line() +
+    labs(title = "Trend of the number of members grouped by type")
+```
+
+```{r}
+# Spatial EDA
+gyms_sf <- df %>%
+  distinct(HashedGymPublicName, .keep_all = TRUE) %>%
+  st_as_sf(coords = c("Longitude", "Latitude"), crs = 4326)
+tmap_mode("view")
+tm_shape(gyms_sf) +
+  tm_dots(size = 0.1, col = "TotalMembers",
+          palette = "Blues", title = "Number of members")
+
+# Examples of categorical trend
+nb <- spdep::knearneigh(st_coordinates(gyms_sf), k = 8) %>% spdep::knn2nb()
+lw <- spdep::nb2listw(nb, style = "W")
+spdep::moran.test(gyms_sf$TotalMembers, lw)
+```
+
+```{r}
+# Bivariate
+cor_df <- df %>% select(all_of(key_numeric_vars)) %>% na.omit()
+corrplot(cor(cor_df), method = "color", type = "upper",
+         title = "Correlation Matrix of Numerical Features")
+
+# Scatter points：Total Members vs Promo Percentage
+df %>%
+  ggplot(aes(x = PromoPercentage, y = TotalMembers)) +
+    geom_point(alpha = 0.4) +
+    geom_smooth(method = "lm") +
+    labs(title = "Promotion ratio vs. Number of members")
+
+# User density vs. number of members
+df %>%
+  ggplot(aes(x = user_density, y = TotalMembers)) +
+    geom_point(alpha = 0.4) + geom_smooth(method = "lm") +
+    labs(title = "User density vs. Total number of members",
+         x = "User density", y = "Tital number of members")
+
+
+ggplot(df, aes(x = AvgAccountPayment, y = TotalMembers)) +
+  geom_point(alpha = 0.6, size = 1.5, color ="black") +
+  geom_smooth(method = "loess", se = TRUE, color = "red", linetype = "solid") +
+  labs(
+    title = "Relationship between Total Members & AAP",
+    x = "Average Account Payment (£)",
+    y = "Total Members"
+  ) +
+  theme_minimal(base_size = 14) +
+  theme(
+    plot.title = element_text(face = "bold", hjust = 0.5),
+    axis.title = element_text(face = "bold"),
+    panel.grid.minor = element_blank()
+  )
+
+cor(df$AvgAccountPayment, df$TotalMembers, use = "complete.obs")
+```
+
+
+# Select variables
+```{r}
+# Candidate variable definition
+
+exclude_vars <- c("TotalMembers", "StartMonth", "HashedGymPublicName", "Longitude", "Latitude")
+cand_vars <- setdiff(names(df), exclude_vars)
+safe_vars <- paste0("`", cand_vars, "`")
+formula_all <- reformulate(termlabels = safe_vars, response = "logTM")
+
+# Preliminary OLS
+# Fit an OLS model with all candidate variables
+df_mod <- df %>% mutate(logTM = log(TotalMembers + 1))
+ols1 <- lm(formula_all, data = df_mod)
+print(summary(ols1))
+# Check for variables that are completely collinear
+aliases <- alias(ols1)
+if(length(aliases$Complete) > 0) {
+  cat("Completely collinear variables (linear combinations) detected:", paste(names(aliases$Complete), collapse=", "), "")
+  cat("Please use alias(ols1) to view the specific linear relationship, and retry after manually removing collinear variables.")
+} else {
+  # VIF calculation, capturing aliasing coefficient errors
+  vif_vals <- tryCatch(car::vif(ols1), error = function(e) {
+    message("Unable to calculate VIF: The model has aliased coefficients. Please use alias(ols1) to view and remove collinear variables.")
+    NULL
+  })
+  print(vif_vals)
+}
+
+# stepwise regression guided by BIC
+step_bic <- step(ols1, direction = "both", k = log(nrow(df)))
+print(summary(step_bic))
+
+# LASSO variable screening
+x <- model.matrix(formula_all, data = df_mod)[,-1]
+y <- df_mod$logTM
+cv_lasso <- cv.glmnet(x, y, alpha = 1)
+best_lambda <- cv_lasso$lambda.min
+lasso_coef <- coef(cv_lasso, s = best_lambda)
+print(lasso_coef)
+
+# Cross - validation model comparison
+set.seed(123)
+train_ctrl <- trainControl(method = "cv", number = 5)
+
+# OLS CV (Variables after step_bic model selection, which can be replaced with formula_all)
+cv_ols <- train(
+  formula_all,
+  data = df_mod,
+  method = "lm",
+  trControl = train_ctrl
+)
+print(cv_ols)
+
+# LASSO CV
+cv_glmnet <- train(
+  x = x, y = y,
+  method = "glmnet",
+  tuneGrid = expand.grid(alpha = 1, lambda = cv_lasso$lambda),
+  trControl = train_ctrl
+)
+print(cv_glmnet)
+
+# Visualize CV results
+plot(caret::varImp(cv_ols), main = "OLS Variable Importance")
+
+imp <- caret::varImp(cv_glmnet)$importance
+imp$Var <- rownames(imp)
+top20 <- imp %>%
+  arrange(desc(Overall)) %>%
+  slice_head(n = 20)
+ggplot(top20, aes(x = reorder(Var, Overall), y = Overall)) +
+  geom_col(fill = "steelblue") +
+  coord_flip() +
+  scale_y_continuous(expand = c(0, 0)) +
+  labs(
+    title = "LASSO Most Important 20 Variables",
+    x = NULL,
+    y = "Importance"
+  ) +
+  theme_minimal(base_size = 12) +
+  theme(
+    axis.text.y = element_text(size = 8),
+    plot.margin = margin(t = 5, r = 20, b = 5, l = 5)
+  )
+```
+
+
+# Variable processing
+```{r}
+selected_vars <- c(
+  "BASEADL_0.5", "POP_0.5_1", "POP_1_2", "POP_2_3", "POP_3_4",
+  "DENS_0_0.5", "DENS_0.5_1", "DENS_1_2", "DENS_2_3", "DENS_3_4",
+  "DENSITY_DROP_2", "DENSITY_DROP_3", "DENSITY_DROP_4",
+  "txn_count_0_1_mi", "txn_density_0_1_mi",
+  "txn_count_1_2_mi", "txn_density_1_2_mi",
+  "txn_count_2_3_mi", "txn_density_2_3_mi",
+  "txn_count_3_4_mi", "txn_density_3_4_mi"
+)
+
+id_cols   <- c("HashedGymPublicName", "Longitude", "Latitude", "StartMonth")
+# Numerical predictor variables (excluding ID, latitude and longitude, time, and response)
+num_cols <- df %>% 
+  select(-all_of(id_cols), -TotalMembers) %>% 
+  select(where(is.numeric)) %>% 
+  names()
+# Categorical (non-numerical) predictor variables
+cat_cols <- df %>% 
+  select(-all_of(id_cols), -TotalMembers) %>% 
+  select(where(~ !is.numeric(.))) %>% 
+  names()
+
+# Calculate skewness
+skew_df <- tibble(
+  var = selected_vars,
+  skew = map_dbl(selected_vars, ~ skewness(df[[.x]], na.rm = TRUE))
+)
+
+# Classification processing methods
+skewed_vars <- skew_df %>% filter(abs(skew) > 1) %>% pull(var)
+scale_vars  <- setdiff(selected_vars, skewed_vars)
+
+# • For variables with small skewness (scale_vars), it is quite reasonable to directly perform standardization ((x - mean)/sd).
+# •	For variables with high skewness (skewed_vars), standardization still retains the influence of extreme values, and the effect may not be as good as first applying logarithmic transformation/Box–Cox transformation and then standardization.
+
+df_trans <- df %>%
+  mutate(across(all_of(skewed_vars), ~ log(.x + 1))) %>%
+  mutate(across(all_of(scale_vars), ~ as.numeric(scale(.x)))) %>%
+  mutate(across(all_of(cat_cols), as.factor))
+
+# Perform preprocessing (only on selected columns)
+df_final <- df %>%
+  mutate(across(all_of(skewed_vars), ~ log(.x + 1))) %>%
+  mutate(across(all_of(scale_vars),  ~ as.numeric(scale(.x)))) %>%
+  mutate(across(all_of(cat_cols), as.factor))  # 保持你原来的分类处理逻辑
+
+
+# Check which variables are logged and which are standardized.
+skew_df %>% mutate(transformed = case_when(
+  var %in% skewed_vars ~ "log1p",
+  var %in% scale_vars  ~ "standardize",
+  TRUE                 ~ "—"
+)) %>% print(n = Inf)
+
+glimpse(df_final)
+```
+
+
+```{r}
+df_tmp <- df %>%
+  mutate(
+    logTM = log(TotalMembers)
+  )
+
+# 1. First, define a set of possible β values;
+# 2. For each β, perform a simple model cross - validation (here only weighted_pop is used for demonstration, and you can also bring in all weighted features at once).
+# 3. Record the β corresponding to the minimum RMSE.
+# 4. Finally, assign this best_beta to your mutate to generate the formal weighted features.
+
+betas <- seq(0.1, 2, by = 0.1)
+results <- tibble(beta = betas, RMSE = NA_real_)
+
+set.seed(42)
+for(i in seq_along(betas)) {
+  b <- betas[i]
+  df_w <- df_tmp %>%
+    mutate(
+      weighted_pop = 
+        POP_0.5_1 * exp(-b * 0.75) +
+        POP_1_2   * exp(-b * 1.5)  +
+        POP_2_3   * exp(-b * 2.5)  +
+        POP_3_4   * exp(-b * 3.5)
+    )
+  cv <- train(
+    logTM ~ weighted_pop,
+    data      = df_w,
+    method    = "lm",
+    trControl = trainControl(method = "cv", number = 5)
+  )
+  results$RMSE[i] <- cv$results$RMSE
+}
+
+best <- results %>% slice_min(RMSE, n = 1)
+best_beta <- best$beta
+cat("best β =", best_beta, "Corresponding to RMSE =", best$RMSE, "\n")
+beta <- best_beta
+
+df_time <- df %>%
+  # Exponential decay weighted features
+    mutate(
+    weighted_pop = 
+      POP_0.5_1 * exp(-beta * 0.75) +
+      POP_1_2 * exp(-beta * 1.5)  +
+      POP_2_3 * exp(-beta * 2.5)  +
+      POP_3_4 * exp(-beta * 3.5),
+
+    weighted_den =
+      DENS_0_0.5 * exp(-beta * 0.25) +
+      DENS_0.5_1 * exp(-beta * 0.75) +
+      DENS_1_2 * exp(-beta * 1.5)  +
+      DENS_2_3 * exp(-beta * 2.5)  +
+      DENS_3_4 * exp(-beta * 3.5),
+
+    weighted_txn =
+      txn_density_0_1_mi * exp(-beta * 0.5)  +
+      txn_density_1_2_mi * exp(-beta * 1.5)  +
+      txn_density_2_3_mi * exp(-beta * 2.5)  +
+      txn_density_3_4_mi * exp(-beta * 3.5),
+
+    weighted_comp =
+      `0-0.5_mile_comp` * exp(-beta * 0.25) +
+      `0.5-1_mile_comp` * exp(-beta * 0.75) +
+      `1-2_mile_comp`   * exp(-beta * 1.5),
+
+    weighted_unis =
+      unis_within_0_0.5_mile * exp(-beta * 0.25) +
+      unis_within_0.5_1_mile * exp(-beta * 0.75) +
+      unis_within_1_2_mile   * exp(-beta * 1.5),
+
+    weighted_density_drop =
+      DENSITY_DROP_2 * exp(-beta * 0.75) +
+      DENSITY_DROP_3 * exp(-beta * 1.5)  +
+      DENSITY_DROP_4 * exp(-beta * 2.5),
+
+    weighted_ring_share =
+      NEAR_POP_SHARE * exp(-beta * 0.25) +
+      INNER_RING_SHARE * exp(-beta * 0.75),
+
+    weighted_ratio =
+      RATIO_0_5_TO_1 * exp(-beta * 0.75) +
+      RATIO_1_TO_2 * exp(-beta * 1.5)
+  )%>%
+  mutate(
+    price_share = AvgAccountPayment / avg_spend_per_user
+  )
+
+
+
+m_wpop <- mean(df_time$weighted_pop, na.rm = TRUE)
+sd_wpop   <- sd(  df_time$weighted_pop, na.rm = TRUE)
+
+m_wden <- mean(df_time$weighted_den, na.rm = TRUE)
+sd_wden   <- sd(  df_time$weighted_den, na.rm = TRUE)
+
+m_wtxn <- mean(df_time$weighted_txn, na.rm = TRUE)
+sd_wtxn   <- sd(  df_time$weighted_txn, na.rm = TRUE)
+
+m_wcomp <- mean(df_time$weighted_comp, na.rm = TRUE)
+sd_wcomp   <- sd(  df_time$weighted_comp, na.rm = TRUE)
+
+m_unis_std <- mean(df_time$weighted_unis, na.rm = TRUE)
+sd_unis_std   <- sd(  df_time$weighted_unis, na.rm = TRUE)
+
+m_ddrop_std   <- mean(df_time$weighted_density_drop, na.rm=TRUE)
+sd_ddrop_std    <-  sd(df_time$weighted_density_drop, na.rm=TRUE)
+
+m_ringshare_std    <- mean(df_time$weighted_ring_share, na.rm=TRUE)
+sd_ringshare_std      <-sd(df_time$weighted_ring_share, na.rm=TRUE)
+
+m_ratio_std    <- mean(df_time$weighted_ratio, na.rm=TRUE)
+sd_ratio_std    <- sd(df_time$weighted_ratio, na.rm=TRUE)
+
+
+df_time <- df_time %>%
+  mutate(
+    w_pop = (weighted_pop - m_wpop) / sd_wpop,
+    w_den = (weighted_den - m_wden) / sd_wden,
+    w_txn = (weighted_txn - m_wtxn) / sd_wtxn,
+    w_comp = (weighted_comp - m_wcomp) / sd_wcomp,
+    w_unis = (weighted_unis - m_unis_std) / sd_unis_std,
+    w_ddrop_std = (weighted_density_drop - m_ddrop_std) / sd_ddrop_std,            
+    w_ringshare_std = (weighted_ring_share - m_ringshare_std) / sd_ringshare_std,                 
+    w_ratio_std =(weighted_ratio - m_ratio_std) / sd_ratio_std
+  )
+```
+
+
+
+```{r}
+# Define the variables to be excluded
+drop_vars <- c(
+  "POP_0.5_1", "POP_1_2", "POP_2_3", "POP_3_4",
+  "DENS_0_0.5", "DENS_0.5_1", "DENS_1_2", "DENS_2_3", "DENS_3_4",
+  "txn_density_0_1_mi", "txn_density_1_2_mi", 
+  "txn_density_2_3_mi", "txn_density_3_4_mi",
+  "txn_count_0_1_mi", "txn_count_1_2_mi", 
+  "txn_count_2_3_mi", "txn_count_3_4_mi",
+  "0-0.5_mile_comp", "0.5-1_mile_comp", "1-2_mile_comp",
+  "unis_within_0_0.5_mile", "unis_within_0.5_1_mile", "unis_within_1_2_mile",
+  "DENSITY_DROP_2", "DENSITY_DROP_3", "DENSITY_DROP_4",
+  "NEAR_POP_SHARE", "INNER_RING_SHARE", 
+  "RATIO_0_5_TO_1", "RATIO_1_TO_2", 
+  "weighted_pop", "weighted_den", "weighted_txn", "weighted_comp","weighted_unis",
+  "weighted_density_drop", "weighted_ring_share", "weighted_ratio"
+)
+
+# Select numerical variables and exclude the above-mentioned variables
+numeric_data <- df_time %>% 
+  select(where(is.numeric)) %>%
+  select(-any_of(drop_vars))
+
+# Calculate the correlation coefficient matrix
+cor_mat <- cor(numeric_data, use = "complete.obs")
+cor_vec <- cor_mat["TotalMembers", ]
+cor_vec <- cor_vec[names(cor_vec) != "TotalMembers"]
+# Take the top 10 with the highest absolute values
+top10 <- sort(abs(cor_vec), decreasing = TRUE)[1:10]
+
+top10_df <- tibble(
+  Variable    = names(top10),
+  Correlation = cor_vec[names(top10)]
+)
+
+print(top10_df)
+```
+
+
+# 普通线性回归
+Main Indicators and Model Summary
+$$
+RMSE = \sqrt{\frac{1}{n} \sum ( \hat{y}_i - y_i )^2},
+\\\quad MAE = \frac{1}{n} \sum |\hat{y}_i - y_i|
+$$
+
+# OLS
+```{r}
+# Divide the training set and the test set (3/4; 1/4) by each row.
+df_time$GymSiteType <- factor(df_time$GymSiteType,levels = c("Hybrid", "Residential", "Workforce"))
+sp <- initial_split(df_time, prop = .75)
+set_train <- training(sp)
+set_test <- testing(sp)
+
+set_train_ols <- set_train %>% select(-any_of(c(drop_vars, "HashedGymPublicName", "StartMonth")))
+set_test_ols <- set_test %>% select(-any_of(c(drop_vars, "HashedGymPublicName", "StartMonth")))
+
+# OLS
+m_ols <- lm(TotalMembers ~ ., data = set_train_ols)
+pred_ols <- predict(m_ols, newdata = set_test_ols)
+
+# RMSE 和 MAE
+rmse <- sqrt(mean((pred_ols - set_test_ols$TotalMembers)^2))
+mae  <- mean(abs(pred_ols - set_test_ols$TotalMembers))
+
+summary(m_ols)
+cat(glue::glue("
+RMSE = {round(rmse,2)}
+MAE  = {round(mae,2)}
+R2_ols = {round(summary(m_ols)$r.squared,2)}
+adj_R2_ols = {round(summary(m_ols)$adj.r.squared,2)}
+"))
+```
+
+
+
+# Lasso
+```{r}
+set_train_lasso <- set_train_ols
+set_test_lasso <- set_test_ols
+
+X_train <- set_train_lasso %>%
+  select(where(is.numeric)) %>%
+  select(-TotalMembers) %>%
+  as.matrix()
+y_train <- set_train_lasso$TotalMembers
+
+X_test <- set_test_lasso %>%
+  select(where(is.numeric)) %>%
+  select(-TotalMembers) %>%
+  as.matrix()
+y_test  <- set_test_lasso$TotalMembers
+
+# Select λ by cross - validation
+set.seed(2025)
+cv_lasso <- cv.glmnet(
+  x = X_train,
+  y = y_train,
+  alpha = 1,       
+  nfolds = 10,
+  type.measure = "mse"
+)
+# View the optimal lambda
+best_lambda <- cv_lasso$lambda.min
+cat("The best λ = ", best_lambda, "\n")
+
+# Visualize the CV curve
+plot(cv_lasso)
+abline(v = log(best_lambda), col = "red", lty = 2)
+
+# Fit Lasso with the optimal λ
+m_lasso <- glmnet(
+  x = X_train,
+  y = y_train,
+  alpha  = 1,
+  lambda = best_lambda
+)
+
+# Predict and evaluate on the test set
+pred_lasso <- predict(m_lasso, newx = X_test, s = best_lambda)
+rmse_lasso <- sqrt(mean((pred_lasso - y_test)^2))
+mae_lasso  <- mean(abs(pred_lasso - y_test))
+sst_lasso <- sum((y_test - mean(y_test))^2)
+sse_lasso <- sum((y_test - pred_lasso)^2)
+R2_lasso <- 1 - sse_lasso / sst_lasso
+
+n <- length(y_test)
+p <- length(coef(m_lasso)) - 1
+adjR2_lasso <- 1 - (1 - R2_lasso) * (n - 1) / (n - p - 1)
+
+cat(sprintf("
+Lasso Regression (λ=%.5f) Test Set Evaluation：
+  - RMSE = %.2f
+  - MAE  = %.2f
+  - R2   = %.4f
+  - Adjusted R2 = %.4f
+", best_lambda, rmse_lasso, mae_lasso, R2_lasso, adjR2_lasso))
+```
+
+
+# JAGS
+```{r}
+# AvgAccountPayment
+mean_AAP <- mean(set_train$AvgAccountPayment, na.rm = TRUE)
+sd_AAP <- sd(set_train$AvgAccountPayment, na.rm = TRUE)
+
+# AvgJoiningFee
+mean_AJF <- mean(set_train$AvgJoiningFee, na.rm = TRUE)
+sd_AJF <- sd(set_train$AvgJoiningFee, na.rm = TRUE)
+
+# distance_weighted_spend
+mean_dws <- mean(set_train$distance_weighted_spend, na.rm = TRUE)
+sd_dws <- sd(set_train$distance_weighted_spend, na.rm = TRUE)
+
+# avg_spend_per_user
+mean_aspu <- mean(set_train$avg_spend_per_user, na.rm = TRUE)
+sd_aspu <- sd(set_train$avg_spend_per_user, na.rm = TRUE)
+
+df_jags <- set_train %>%
+  mutate(
+    y = log(TotalMembers),
+    AAP = (AvgAccountPayment - mean_AAP) / sd_AAP,
+    AJF = (AvgJoiningFee - mean_AJF) / sd_AJF,
+    dws = (distance_weighted_spend - mean_dws) / sd_dws,
+    urepeat = user_repeat_rate,
+    u1 = UMAP2D_1,
+    u2 = UMAP2D_2,
+    competitor = CompetitorIndex,
+    aspu = (avg_spend_per_user - mean_aspu) / sd_aspu,
+    ampu = avg_merchant_per_user,
+    parking_num = as.integer(GymParking == "Parking"),
+    lat = Latitude,
+    lon = Longitude,
+    userd = user_density,
+    w_ddrop = w_ddrop_std,
+    w_unis = w_unis,
+    promo = PromoPercentage,
+    w_ringshare = w_ringshare_std,
+    w_ratio = w_ratio_std,
+    w_den = w_den,
+    w_txn = w_txn,
+    w_comp = w_comp,
+  
+    group = as.integer(GymSiteType)
+  )
+
+
+# data for jags
+data_jags <- list(
+  N = nrow(df_jags),
+  J = nlevels(df_jags$GymSiteType),
+  y = df_jags$y,
+  AAP = df_jags$AAP,
+  AJF = df_jags$AJF,
+  dws = df_jags$dws,
+  urepeat = df_jags$urepeat,
+  u1 = df_jags$u1,
+  u2 = df_jags$u2,
+  competitor = df_jags$competitor,
+  aspu = df_jags$aspu,
+  ampu = df_jags$ampu,
+  parking = df_jags$parking_num,
+  lat = df_jags$lat,
+  lon = df_jags$lon,
+  userd = df_jags$userd,
+  w_ddrop = df_jags$w_ddrop,
+  w_unis = df_jags$w_unis,
+  promo = df_jags$promo,
+  w_ringshare = df_jags$w_ringshare,
+  w_ratio = df_jags$w_ratio,
+  w_den = df_jags$w_den,
+  w_txn = df_jags$w_txn,
+  w_comp = df_jags$w_comp,
+  
+  group      = df_jags$group,
+  tau_mu     = 1,
+  tau_beta   = 1,
+  sigma_max  = 1000
+)
+
+
+m_hier <- "
+model {
+  for(i in 1:N) {
+    y[i] ~ dnorm(mu[i], tau)
+    mu[i] <- alpha[group[i]]
+             + beta_AAP * AAP[i]
+             + beta_AJF * AJF[i]
+             + beta_dws * dws[i]
+             + beta_urepeat * urepeat[i]
+             + beta_u1 * u1[i]
+             + beta_u2 * u2[i]
+             + beta_comp * competitor[i]
+             + beta_aspu * aspu[i]
+             + beta_ampu * ampu[i]
+             + beta_parking * parking[i]
+             + beta_lat * lat[i]
+             + beta_lon * lon[i]
+             + beta_userd * userd[i]
+             + beta_w_ddrop * w_ddrop[i]
+             + beta_w_unis * w_unis[i]
+             + beta_promo * promo[i]
+             + beta_w_ringshare * w_ringshare[i]
+             + beta_w_ratio * w_ratio[i]
+             + beta_w_den * w_den[i]
+             + beta_w_txn * w_txn[i]
+             + beta_w_comp * w_comp[i]
+  }
+  
+  # 随机截距
+  for(j in 1:J) {
+    alpha[j] ~ dnorm(mu_alpha, tau_mu)
+  }
+  # 超先验
+  mu_alpha ~ dnorm(0, tau_mu)
+  
+  beta_AAP ~ dnorm(0, tau_beta)
+  beta_AJF ~ dnorm(0, tau_beta)
+  beta_dws ~ dnorm(0, tau_beta)
+  beta_urepeat ~ dnorm(0, tau_beta)
+  beta_u1 ~ dnorm(0, tau_beta)
+  beta_u2 ~ dnorm(0, tau_beta)
+  beta_comp ~ dnorm(0, tau_beta)
+  beta_aspu ~ dnorm(0, tau_beta)
+  beta_ampu ~ dnorm(0, tau_beta)
+  beta_parking ~ dnorm(0, tau_beta)
+  beta_lat ~ dnorm(0, tau_beta)
+  beta_lon ~ dnorm(0, tau_beta)
+  beta_userd ~ dnorm(0, tau_beta)
+  beta_w_ddrop ~ dnorm(0, tau_beta)
+  beta_w_unis ~ dnorm(0, tau_beta)
+  beta_promo ~ dnorm(0, tau_beta)
+  beta_w_ringshare ~ dnorm(0, tau_beta)
+  beta_w_ratio ~ dnorm(0, tau_beta)
+  beta_w_den ~ dnorm(0, tau_beta)
+  beta_w_txn ~ dnorm(0, tau_beta)
+  beta_w_comp ~ dnorm(0, tau_beta)
+  
+  tau_alpha <- pow(sigma_alpha, -2)
+  sigma_alpha ~ dunif(0, sigma_max)
+  tau <- pow(sigma, -2)
+  sigma ~ dunif(0, sigma_max)
+}
+"
+
+# Initial value
+ini_value <- function(){
+  list(
+    mu_alpha = rnorm(1,0,1),
+    alpha = rnorm(data_jags$J,0,1),
+
+    beta_AAP = dnorm(0, 1),
+    beta_AJF = dnorm(0, 1),
+    beta_dws = dnorm(0, 1),
+    beta_urepeat = rnorm(1),
+    beta_u1 = rnorm(1),
+    beta_u2 = rnorm(1),
+    beta_comp = rnorm(1),
+    beta_aspu = rnorm(1),
+    beta_ampu = rnorm(1),
+    beta_parking = rnorm(1),
+    beta_lat = rnorm(1),
+    beta_lon = rnorm(1),
+    beta_userd = rnorm(1),
+    beta_w_ddrop = rnorm(1),
+    beta_w_unis = rnorm(1),
+    beta_promo = rnorm(1),
+    beta_w_ringshare = rnorm(1),
+    beta_w_ratio = rnorm(1),
+    beta_w_den  = rnorm(1),
+    beta_w_txn  = rnorm(1),
+    beta_w_comp = rnorm(1),
+    
+    sigma = runif(1,0,10),
+    sigma_alpha = runif(1,0,10)
+  )
+}
+
+
+# sample
+set.seed(2025)
+m_jags <- jags.model(textConnection(m_hier),
+                  data = data_jags,
+                  inits = ini_value,
+                  n.chains = 3, quiet=TRUE)
+update(m_jags, 4000)
+
+pars_jags <- c("mu_alpha","alpha",
+               "beta_AAP","beta_AJF", "beta_dws",
+               "beta_urepeat","beta_u1","beta_u2","beta_comp",
+               "beta_aspu","beta_ampu","beta_parking","beta_lat",
+               "beta_lon", "beta_userd", "beta_w_ddrop","beta_w_unis", 
+               "beta_promo","beta_w_ringshare", "beta_w_ratio", "beta_w_den",
+               "beta_w_txn", "beta_w_comp", "sigma","sigma_alpha")
+mcmc_jags <- coda.samples(m_jags, pars_jags, n.iter=10000)
+
+# 5.1 Gelman–Rubin R-hat & ESS
+gel_full <- gelman.diag(mcmc_jags, multivariate = FALSE)
+print(gel_full)
+
+# If all R-hats are ≤ 1.05 and the ESS is large enough, it is considered to have good convergence.
+# DIC
+dic <- dic.samples(m_jags, type="pD", n.iter=4000)
+cat("DIC =", sum(dic$deviance)+sum(dic$penalty), "\n")
+
+
+
+# Posterior mean prediction, RMSE, MAE
+invisible({
+# Extract the posterior mean
+poster <- suppressWarnings(summary(mcmc_jags)$statistics)
+
+
+a <- poster[grep("^alpha\\[", rownames(poster)), "Mean"]
+b <- function(x) poster[x, "Mean"]
+
+# Build the linear predicted value mu
+mu_hat <- a[data_jags$group] +
+  b("beta_AAP") * data_jags$AAP +
+  b("beta_AJF") * data_jags$AJF +
+  b("beta_dws") * data_jags$dws +
+  b("beta_urepeat") * data_jags$urepeat +
+  b("beta_u1") * data_jags$u1 +
+  b("beta_u2") * data_jags$u2 +
+  b("beta_comp") * data_jags$competitor +
+  b("beta_aspu") * data_jags$aspu +
+  b("beta_ampu") * data_jags$ampu +
+  b("beta_parking") * data_jags$parking +
+  b("beta_lat") * data_jags$lat +
+  b("beta_lon") * data_jags$lon +
+  b("beta_userd") * data_jags$userd +
+  b("beta_w_ddrop") * data_jags$w_ddrop +
+  b("beta_w_unis") * data_jags$w_unis +
+  b("beta_promo") * data_jags$promo +
+  b("beta_w_ringshare") * data_jags$w_ringshare +
+  b("beta_w_ratio") * data_jags$w_ratio +
+  b("beta_w_den") * data_jags$w_den +
+  b("beta_w_txn") * data_jags$w_txn +
+  b("beta_w_comp") * data_jags$w_comp
+  
+# Restore the predicted values to the original space
+TotalMembers_hat <- exp(mu_hat)
+y_true <- exp(data_jags$y)
+
+# Evaluation indicators
+rmse_jags <- sqrt(mean((TotalMembers_hat - y_true)^2))
+mae_jags  <- mean(abs(TotalMembers_hat - y_true))
+})
+
+cat(sprintf("
+Model Metrics:
+RMSE_jags = %.2f
+MAE_jags  = %.2f
+", rmse_jags, mae_jags))
+
+
+# R2
+# True values & JAGS predicted values
+pred_jags <- TotalMembers_hat
+
+# Sample size \(n\) and the number of fixed effects \(p\) (excluding the random intercept and the intercept term)
+n <- length(y_true)
+p <- 21
+
+# SSE & SST
+SSE_jags <- sum((pred_jags - y_true)^2)
+SST      <- sum((y_true - mean(y_true))^2)
+
+R2_jags <- 1 - SSE_jags / SST
+adjR2_jags <- 1 - (1 - R2_jags) * (n - 1) / (n - p - 1)
+
+cat(sprintf("JAGS model R2v= %.4f\n", R2_jags))
+cat(sprintf("JAGS model Adjusted R2 = %.4f\n", adjR2_jags))
+```
+
+# jags Research on Variable Influence
+```{r}
+poster <- summary(mcmc_jags)$statistics
+
+# Only take the main slope variables (starting with beta_)
+sel <- grep("^beta_", rownames(poster))
+coefs <- poster[sel, c("Mean", "SD")]
+coefs <- as.data.frame(coefs)
+coefs$Var <- rownames(coefs)
+coefs$AbsMean <- abs(coefs$Mean)
+
+# Sort and display
+coefs_sorted <- coefs[order(-coefs$AbsMean), ]
+print(coefs_sorted[, c("Var", "Mean", "SD", "AbsMean")], digits = 3)
+```
+
+
+# SPDE
+```{r}
+df_spde <- df_jags
+
+# Extract the latitude and longitude matrix
+coords <- as.matrix(df_spde[, c("lon", "lat")])
+
+# Build a triangular mesh
+mesh <- inla.mesh.2d(
+  loc = coords,
+  max.edge = c(0.1, 0.5),
+  cutoff = 0.01,
+  offset = c(0.1, 0.2)
+)
+
+# Define the SPDE Matern prior
+spde <- inla.spde2.pcmatern(
+  mesh = mesh,
+  prior.range = c(0.1, 0.5),
+  prior.sigma = c(1, 0.01)
+)
+
+# Projection matrix A
+A <- inla.spde.make.A(mesh, loc = coords)
+
+# Construct INLA stack (fixed effects + spatial random field)
+df_spde$GymSiteType <- factor(df_spde$GymSiteType, 
+                              levels = c("Hybrid", "Residential", "Workforce"))
+stk <- inla.stack(
+  data  = list(y = df_spde$y),
+  A  = list(1, A),
+  effects = list(
+    data.frame(
+      intercept = 1,
+      GymSiteType = df_spde$GymSiteType,
+      AAP = df_spde$AAP,
+      AJF = df_spde$AJF,
+      dws = df_spde$dws,
+      urepeat = df_spde$urepeat,
+      u1 = df_spde$u1,
+      u2 = df_spde$u2,
+      competitor = df_spde$competitor,
+      aspu = df_spde$aspu,
+      ampu = df_spde$ampu,
+      parking_num = df_spde$parking_num,
+      lat = df_spde$lat,
+      lon = df_spde$lon,
+      userd = df_spde$userd,
+      w_ddrop = df_spde$w_ddrop,
+      w_unis = df_spde$w_unis,
+      promo = df_spde$promo,
+      w_ringshare = df_spde$w_ringshare,
+      w_ratio = df_spde$w_ratio,
+      w_den = df_spde$w_den,
+      w_txn = df_spde$w_txn,
+      w_comp = df_spde$w_comp
+    ),
+    field = 1:spde$n.spde
+  ),
+  tag = "est"
+)
+
+# Spatial Model Formula
+formula_spde <- y ~ -1 + intercept +
+  GymSiteType * AAP + 
+  AJF + dws + urepeat + u1 + u2 + competitor +
+  aspu + ampu + parking_num + lat + lon + userd +
+  w_ddrop + w_unis + promo + w_ringshare + w_ratio +
+  w_den + w_txn + w_comp + f(field, model = spde)
+
+# Spatial Model Formula
+res_spde <- inla(
+  formula = formula_spde,
+  data = inla.stack.data(stk),
+  family = "gaussian",
+  control.predictor= list(
+    A = inla.stack.A(stk),
+    compute = TRUE
+  ),
+  control.compute  = list(
+    dic  = TRUE,
+    waic = TRUE,
+    cpo  = TRUE
+  )
+)
+
+cat(sprintf("DIC=%.2f  WAIC=%.2f\n",
+            res_spde$dic$dic, res_spde$waic$waic))
+
+# Compare prediction performance（RMSE/MAE）
+# True TotalMembers
+y_true <- exp(df_spde$y)
+
+# Take out the predicted indices of the "est" part in the stack
+idx_est <- inla.stack.index(stk, "est")$data
+
+# Extract the corresponding predictions and restore them to the original space
+pred_spde_obs <- exp(res_spde$summary.fitted.values$mean[idx_est])
+
+rmse_spde <- sqrt(mean((pred_spde_obs - y_true)^2))
+mae_spde  <- mean(abs(pred_spde_obs - y_true))
+
+cat(sprintf("Spatial model RMSE_spde = %.2f, MAE_spde = %.2f\n", rmse_spde, mae_spde))
+
+
+# R2
+p <- length(res_spde$summary.fixed$mean) - 1 
+n <- length(y_true)
+
+#  SSE & SST
+SSE <- sum((y_true - pred_spde_obs)^2)
+SST <- sum((y_true - mean(y_true))^2)
+
+R2 <- 1 - SSE / SST
+adjR2 <- 1 - (1 - R2) * (n - 1) / (n - p - 1)
+
+cat(sprintf("R2 = %.4f\n", R2))
+cat(sprintf("adjR2 = %.4f\n", adjR2))
+```
+
+
+# Verify spde on the test set
+```{r}
+df_spde_test <- set_test %>%
+  mutate(
+    y = log(TotalMembers),
+    AAP = (AvgAccountPayment - mean_AAP) / sd_AAP,
+    AJF = (AvgJoiningFee - mean_AJF) / sd_AJF,
+    dws = (distance_weighted_spend - mean_dws) / sd_dws,
+    urepeat = user_repeat_rate,
+    u1 = UMAP2D_1,
+    u2 = UMAP2D_2,
+    competitor = CompetitorIndex,
+    aspu = (avg_spend_per_user - mean_aspu) / sd_aspu,
+    ampu = avg_merchant_per_user,
+    parking_num = as.integer(GymParking == "Parking"),
+    lat = Latitude,
+    lon = Longitude,
+    userd = user_density,
+    w_ddrop = w_ddrop_std,
+    w_unis = w_unis,
+    promo = PromoPercentage,
+    w_ringshare = w_ringshare_std,
+    w_ratio = w_ratio_std,
+    w_den = w_den,
+    w_txn = w_txn,
+    w_comp = w_comp,
+    GymSiteType = factor(GymSiteType,levels = c("Hybrid", "Residential", "Workforce")),
+    group = as.integer(GymSiteType)
+  )
+df_spde_test$intercept <- 1
+
+# Prepare test set coordinates & covariates
+coords_test <- as.matrix(df_spde_test[, c("lon","lat")])
+
+# Construct the projection matrix A_test
+A_test <- inla.spde.make.A(mesh, loc = coords_test)
+
+# Extract the posterior means of the fixed effects and the spatial random fields
+# Fixed effect mean
+beta_mean <- res_spde$summary.fixed$mean
+
+# Mean of the spatial random field (field on nodes)
+field_mean <- res_spde$summary.random$field$mean
+
+# Build a linear prediction mu_test
+# Fixed effects part
+Xtest <- model.matrix(
+  ~ -1 + intercept + GymSiteType * AAP + AJF + dws + urepeat + u1 + u2 + competitor +
+    aspu + ampu + parking_num + lat + lon + userd +
+    w_ddrop + w_unis + promo + w_ringshare + w_ratio +
+    w_den + w_txn + w_comp,
+  data = df_spde_test
+)
+
+mu_fixed <- as.vector(Xtest %*% beta_mean)
+
+# Spatial random field part: Interpolation at test points
+mu_spatial <- as.vector(A_test %*% field_mean)
+
+# Synthesize log predicted values
+mu_test <- mu_fixed + mu_spatial
+
+# Restore to the original TotalMembers space
+pred_test <- exp(mu_test)
+actual_test <- df_spde_test$TotalMembers
+
+# RMSE & MAE
+rmse_test <- sqrt(mean((pred_test - actual_test)^2))
+mae_test  <- mean(abs(pred_test - actual_test))
+
+# R2 
+n_test <- length(actual_test)
+p      <- length(beta_mean) - 1
+
+SSE_test <- sum((actual_test - pred_test)^2)
+SST_test <- sum((actual_test - mean(actual_test))^2)
+
+R2_test    <- 1 - SSE_test / SST_test
+adjR2_test <- 1 - (1 - R2_test) * (n_test - 1) / (n_test - p - 1)
+
+cat(sprintf("Test set performance:\n"))
+cat(sprintf("RMSE_spde_test = %.2f\n", rmse_test))
+cat(sprintf("MAE_spde_test = %.2f\n", mae_test))
+cat(sprintf("R2_spde_test = %.4f\n", R2_test))
+cat(sprintf("Adjusted R2_spde_test= %.4f\n", adjR2_test))
+```
+
+# 对比
+```{r}
+# True values of the training set
+y_true      <- exp(df_jags$y)
+# JAGS predicted value
+pred_jags   <- TotalMembers_hat
+# SPDE predicted value
+pred_spde   <- pred_spde_obs
+
+df_compare <- tibble(
+  actual    = y_true,
+  jags      = pred_jags,
+  spde      = pred_spde
+) %>%
+  pivot_longer(cols = c(jags, spde),
+               names_to  = "model",
+               values_to = "predicted") %>%
+  mutate(
+    residual = actual - predicted
+  )
+
+metrics <- df_compare %>%
+  group_by(model) %>%
+  summarize(
+    RMSE = sqrt(mean((predicted - actual)^2)),
+    MAE  = mean(abs(predicted - actual)),
+    R2   = 1 - sum((actual - predicted)^2) / sum((actual - mean(actual))^2),
+    .groups = "drop"
+  ) %>%
+  pivot_longer(
+    cols = -model,
+    names_to = "metric",
+    values_to = "value"
+  )
+
+p_scatter <- ggplot(df_compare, aes(x = actual, y = predicted, color = model)) +
+  geom_abline(intercept = 0, slope = 1, linetype = "dashed") +
+  geom_point(alpha = 0.5) +
+  labs(x = "True TotalMembers", y = "Predict TotalMembers",
+       title = "True vs Predict Scatter plot",
+       color = "Model") +
+  theme_minimal()
+
+p_resid <- ggplot(df_compare, aes(x = residual, fill = model)) +
+  geom_density(alpha = 0.4) +
+  labs(x = "Residuals (True - Predicted)", y = "Density",
+       title = "Residual Distribution Density Plot",
+       fill = "Model") +
+  theme_minimal()
+
+metrics_plot <- metrics %>%
+  filter(metric %in% c("RMSE", "MAE"))
+
+p_metrics <- ggplot(metrics_plot, aes(x = metric, y = value, fill = model)) +
+  geom_col(position = "dodge") +
+  labs(x = "", y = "", title = "Comparison of Model Metrics") +
+  theme_minimal()
+
+p_scatter
+p_resid
+p_metrics
+```
+
+
+# How sensitive is membership demand to price changes in each location?
+```{r}
+delta_AAP <- 1 / sd_AAP
+london_center_lat <- 51.509865
+london_center_lon <- -0.118092
+london_radius_km <- 25
+
+haversine <- function(lat1, lon1, lat2, lon2) {
+  R <- 6371
+  delta_lat <- (lat2 - lat1) * pi / 180
+  delta_lon <- (lon2 - lon1) * pi / 180
+  a <- sin(delta_lat / 2)^2 + cos(lat1 * pi / 180) * cos(lat2 * pi / 180) * sin(delta_lon / 2)^2
+  c <- 2 * atan2(sqrt(a), sqrt(1 - a))
+  R * c
+}
+
+# Construct a new price variable (AAP + delta_AAP)
+df_spde$intercept <- 1
+df_spde$AAP_new <- df_spde$AAP + delta_AAP
+
+# Use the new AAP to predict the number of members after "the price is increased by 1 pound"
+X_new <- model.matrix(
+  ~ -1 + intercept + GymSiteType * AAP_new + AJF + dws + urepeat + u1 + u2 + competitor +
+    aspu + ampu + parking_num + lat + lon + userd +
+    w_ddrop + w_unis + promo + w_ringshare + w_ratio +
+    w_den + w_txn + w_comp,
+  data = df_spde
+)
+
+coords <- as.matrix(df_spde[, c("lon", "lat")])
+A <- inla.spde.make.A(mesh, loc = coords)
+beta_mean <- res_spde$summary.fixed$mean
+field_mean <- res_spde$summary.random$field$mean
+
+mu_fixed_new <- as.vector(X_new %*% beta_mean)
+mu_spatial <- as.vector(A %*% field_mean)
+mu_pred_new <- mu_fixed_new + mu_spatial
+pred_new <- exp(mu_pred_new)
+
+# Merge into data
+df_sens <- df_spde %>%
+  mutate(
+    price_effect = pred_new - TotalMembers,
+    price_elasticity = 100 * (pred_new - TotalMembers) / TotalMembers,
+    GymSiteType = GymSiteType,
+    london_flag = ifelse(
+      haversine(lat, lon, london_center_lat, london_center_lon) <= london_radius_km,
+      "London", "Other"
+    )
+  )
+
+# Grouping and Visualization
+summary_region <- df_sens %>%
+  group_by(london_flag) %>%
+  summarize(
+    avg_effect = mean(price_effect),
+    avg_elasticity = mean(price_elasticity),
+    weighted_elasticity = sum(price_effect) / sum(TotalMembers) * 100,
+    n = n()
+  )
+
+summary_type <- df_sens %>%
+  group_by(GymSiteType) %>%
+  summarize(
+    avg_effect = mean(price_effect),
+    avg_elasticity = mean(price_elasticity),
+    weighted_elasticity = sum(price_effect) / sum(TotalMembers) * 100,
+    n = n()
+  )
+
+summary_type_region <- df_sens %>%
+  group_by(GymSiteType, london_flag) %>%
+  summarize(
+    avg_effect = mean(price_effect),
+    avg_elasticity = mean(price_elasticity),
+    weighted_elasticity = sum(price_effect) / sum(TotalMembers) * 100,
+    n = n()
+  )
+
+# Visualization
+ggplot(summary_region, aes(x = london_flag, y = avg_effect, fill = london_flag)) +
+  geom_col() +
+  labs(title = "Price Sensitivity: London vs Other",
+       x = "Region", y = "Δ Predicted Membership per £1 Price Increase")
+
+ggplot(summary_type, aes(x = GymSiteType, y = avg_effect, fill = GymSiteType)) +
+  geom_col() +
+  labs(title = "Price Sensitivity by Gym Type",
+       x = "Gym Type", y = "Δ Predicted Membership per £1 Price Increase")
+
+ggplot(summary_type_region, aes(x = GymSiteType, y = avg_effect, fill = london_flag)) +
+  geom_col(position = "dodge") +
+  labs(title = "Price Sensitivity by Gym Type & Region",
+       x = "Gym Type", y = "Δ Predicted Membership per £1 Price Increase", fill = "Region")
+
+kable(
+  summary_type_region,
+  digits = 2,
+  caption = "Average and Weighted Price Elasticity by Gym Type and Region",
+  col.names = c("GymSiteType", "London/Other", 
+                "Avg ΔMembers", "Avg Elasticity (%)", 
+                "Weighted Elasticity (%)", "n")
+)
+```
+```{r}
+uk <- ne_countries(scale = "medium", country = "United Kingdom", returnclass = "sf")
+
+df_sens$GymSiteType <- factor(df_sens$GymSiteType, levels = c("Hybrid", "Residential", "Workforce"))
+
+GymSiteType_colors <- c(
+  "Hybrid" = "blue",
+  "Residential" = "red",
+  "Workforce" = "green"
+)
+
+ggplot() +
+  geom_sf(data = uk, fill = "grey95", color = NA) +
+  geom_point(
+    data = df_sens,
+    aes(
+      x = lon, y = lat,
+      color = GymSiteType,
+      size = abs(price_elasticity)
+    ),
+    alpha = 0.7
+  ) +
+  scale_color_manual(
+    name = "Site type",
+    values = GymSiteType_colors
+  ) +
+  scale_size_continuous(
+    name = "Price elasticity\n(absolute value, %)",
+    breaks = c(1, 2, 3, 4),
+    labels = c("1%", "2%", "3%", "4%+"),
+    range = c(2, 10)
+  ) +
+  labs(
+    x = "Longitude",
+    y = "Latitude",
+    title = "Spatial Distribution of Gym Price Elasticity"
+  ) +
+  coord_sf(xlim = c(-5, 2), ylim = c(50, 57)) +
+  theme_minimal(base_size = 14) +
+  theme(
+    legend.position = "right",
+    plot.title = element_text(size = 16, face = "bold")
+  )
+```
+
+# Visualization
+```{r}
+# Extract all fixed effects
+coef_tab <- res_spde$summary.fixed
+
+# Sort in descending order by absolute mean value
+coef_tab$abs_mean <- abs(coef_tab$mean)
+coef_tab <- coef_tab[order(-coef_tab$abs_mean), ]
+
+# Show the top few
+print(coef_tab[, c("mean", "0.025quant", "0.975quant", "abs_mean")], digits=3)
+
+coef_tab$significant <- with(coef_tab, 
+    ( `0.025quant` > 0 & `0.975quant` > 0 ) | 
+    ( `0.025quant` < 0 & `0.975quant` < 0 )
+)
+
+sig_vars <- coef_tab[coef_tab$significant, ]
+print(sig_vars[, c("mean", "0.025quant", "0.975quant", "significant")], digits=3)
+```
+
+
+
+
+# What’s the ideal price point for maximizing revenue in a specific location?
+```{r}
+# Set price range
+price_grid <- seq(10, 60, by = 0.5)
+
+# Take the first 100 points
+n_sites <- min(100, nrow(df_spde))
+
+# Spatial field average value
+field_mean <- res_spde$summary.random$field$mean
+
+# Record the results
+results <- data.frame(
+  site_id = 1:n_sites,
+  orig_price = NA_real_,
+  GymSiteType = NA_character_,
+  orig_members = NA_real_,
+  best_price = NA_real_,
+  max_revenue = NA_real_,
+  demand_at_best = NA_real_
+)
+
+for (i in 1:n_sites) {
+  this_point <- df_spde[i, ]
+  spatial_offset <- as.vector(A[i, ] %*% field_mean)
+  
+  orig_price <- this_point$AvgAccountPayment
+  orig_members <- this_point$TotalMembers
+  site_type <- as.character(this_point$GymSiteType)
+  
+  rev_grid <- numeric(length(price_grid))
+  demand_grid <- numeric(length(price_grid))
+  
+  for (j in seq_along(price_grid)) {
+    this_price <- price_grid[j]
+    this_AAP <- (this_price - mean_AAP) / sd_AAP
+    
+    covar_row <- data.frame(
+      intercept = 1,
+      GymSiteType = factor(this_point$GymSiteType, levels = c("Hybrid", "Residential", "Workforce")),
+      AAP = this_AAP,
+      AJF = this_point$AJF,
+      dws = this_point$dws,
+      urepeat = this_point$urepeat,
+      u1 = this_point$u1,
+      u2 = this_point$u2,
+      competitor = this_point$competitor,
+      aspu = this_point$aspu,
+      ampu = this_point$ampu,
+      parking_num = this_point$parking_num,
+      lat = this_point$lat,
+      lon = this_point$lon,
+      userd = this_point$userd,
+      w_ddrop = this_point$w_ddrop,
+      w_unis = this_point$w_unis,
+      promo = this_point$promo,
+      w_ringshare = this_point$w_ringshare,
+      w_ratio = this_point$w_ratio,
+      w_den = this_point$w_den,
+      w_txn = this_point$w_txn,
+      w_comp = this_point$w_comp
+    )
+    X_new <- model.matrix(
+      ~ -1 + intercept + GymSiteType * AAP + AJF + dws + urepeat + u1 + u2 + competitor +
+        aspu + ampu + parking_num + lat + lon + userd +
+        w_ddrop + w_unis + promo + w_ringshare + w_ratio +
+        w_den + w_txn + w_comp,
+      data = covar_row
+    )
+    mu_fixed <- as.vector(X_new %*% res_spde$summary.fixed$mean)
+    mu_pred <- mu_fixed + spatial_offset
+    demand <- exp(mu_pred)
+    revenue <- this_price * demand
+    
+    demand_grid[j] <- demand
+    rev_grid[j] <- revenue
+  }
+  
+  max_idx <- which.max(rev_grid)
+  
+  results$orig_price[i]   <- orig_price
+  results$GymSiteType[i]  <- site_type
+  results$orig_members[i] <- orig_members
+  results$best_price[i]   <- price_grid[max_idx]
+  results$max_revenue[i]  <- rev_grid[max_idx]
+  results$demand_at_best[i] <- demand_grid[max_idx]
+}
+
+head(results, 100)
+```
+
+
+
+
+
+
+
+
+
