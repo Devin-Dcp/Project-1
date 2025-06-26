@@ -5,8 +5,5 @@ For full data processing and modelling scripts, see the `code/` directory.
 
 ## Contents
 
-- `/code/`: All R scripts for data cleaning, feature engineering, and modelling
+- `/code/`: project1.Rmd
 - `/data/`: Uoe_data_all.csv
-- `/output/`: Result tables and figures
-- `/report.tex`: Main LaTeX document (calls code from `/code/` in appendix)
-- `/appendix.tex`: Full code listings (see also in the paper appendix)
